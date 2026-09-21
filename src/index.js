@@ -161,7 +161,9 @@ class VKClient {
         );
       }
 
-      const hint = ERROR_SUBCODE_HINTS[data.error.error_subcode] || ERROR_HINTS[code];
+      const hint = /messages (are|is) disabled/.test(msg)
+        ? 'Community messages are off: turn them on in the community settings → Messages, then retry.'
+        : ERROR_SUBCODE_HINTS[data.error.error_subcode] || ERROR_HINTS[code];
       throw new Error(`VK API Error ${code}: ${msg}${hint ? ` — ${hint}` : ''}`);
     }
 
