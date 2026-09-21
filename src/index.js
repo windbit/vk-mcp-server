@@ -187,6 +187,13 @@ class VKClient {
   groupsSearch(params) { return this.call('groups.search', params); }
   groupsJoin(params) { return this.call('groups.join', params); }
 
+  groupsGetTokenPermissions() { return this.call('groups.getTokenPermissions'); }
+
+  // Community messages
+  messagesGetConversations(params) { return this.call('messages.getConversations', { ...params, extended: 1 }); }
+  messagesGetHistory(params) { return this.call('messages.getHistory', { ...params, extended: 1 }); }
+  messagesSend(params) { return this.call('messages.send', params); }
+
   // Friends
   friendsGet(params) { return this.call('friends.get', params); }
 
@@ -289,6 +296,52 @@ Docs: https://github.com/bulatko/vk-mcp-server`);
 const VK_ACCESS_TOKEN = process.env.VK_ACCESS_TOKEN;
 
 const vk = new VKClient(VK_ACCESS_TOKEN);
+
+// VK answers error 27 to most methods when the token belongs to a community,
+// and the model cannot tell that from the tool list: it calls vk_wall_get,
+// fails, and explains the failure instead of doing the work. So the server
+// learns the token kind once and lists only the tools that token can call.
+const TOKEN_PROBE_TIMEOUT_MS = 5000;
+let tokenInfoPromise;
+
+function getTokenInfo() {
+  tokenInfoPromise ??= detectTokenInfo();
+  return tokenInfoPromise;
+}
+
+async function detectTokenInfo() {
+  if (!VK_ACCESS_TOKEN) {
+    return { kind: 'none' };
+  }
+  try {
+    const permissions = await withTimeout(vk.groupsGetTokenPermissions(), TOKEN_PROBE_TIMEOUT_MS);
+    const groups = await withTimeout(vk.groupsGetById({}), TOKEN_PROBE_TIMEOUT_MS);
+    const community = (groups.groups ?? groups)[0];
+    return {
+      kind: 'community',
+      community: { id: community.id, name: community.name, screen_name: community.screen_name, owner_id: -community.id },
+      scopes: permissions.permissions.map((permission) => permission.name),
+    };
+  } catch {
+    // Not a community token, or VK is unreachable: the full list stays.
+    return { kind: VK_ACCESS_TOKEN.startsWith('vk2.') ? 'vkid' : 'user_or_service' };
+  }
+}
+
+async function communityId() {
+  const info = await getTokenInfo();
+  if (info.kind !== 'community') {
+    throw new Error('This tool needs a community token: create one in the community settings → API usage → Access tokens.');
+  }
+  return info.community.id;
+}
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms)),
+  ]);
+}
 
 // ============================================
 // APP UI (MCP Apps)
@@ -633,7 +686,84 @@ const tools = [
       },
     },
   },
+  {
+    name: 'vk_token_info',
+    title: 'What this token can do',
+    description: 'Say which VK token is connected — a community token (acting as one community) or a user one — which community it belongs to, its scopes, and which tools work with it. Call it first when unsure what you can do in VK.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'vk_messages_get_conversations',
+    title: 'Community conversations',
+    description: 'List the community\'s conversations with people, newest first, with the last message of each. Needs the messages scope, and community messages enabled in the community settings.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        count: { type: 'number', description: 'Number of conversations (max 200)' },
+        offset: { type: 'number', description: 'Offset for pagination' },
+        filter: { type: 'string', description: 'all or unread', enum: ['all', 'unread'] },
+      },
+    },
+  },
+  {
+    name: 'vk_messages_get_history',
+    title: 'Conversation history',
+    description: 'Read the messages of one conversation between the community and a person, newest first. peer_id is the person\'s user ID from vk_messages_get_conversations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        peer_id: { type: 'number', description: 'Conversation peer: the user ID' },
+        count: { type: 'number', description: 'Number of messages (max 200)' },
+        offset: { type: 'number', description: 'Offset for pagination' },
+      },
+      required: ['peer_id'],
+    },
+  },
+  {
+    name: 'vk_messages_send',
+    title: 'Reply as the community',
+    description: 'Send a message from the community to a person who has written to it. peer_id is the user ID from vk_messages_get_conversations.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        peer_id: { type: 'number', description: 'Recipient: the user ID' },
+        message: { type: 'string', description: 'Message text' },
+      },
+      required: ['peer_id', 'message'],
+    },
+  },
 ];
+
+// Tools a community token can call; VK answers error 27 or 15 to the rest.
+// Checked against the live API with a community token on 2026-09-22.
+const COMMUNITY_TOOLS = new Set([
+  'vk_token_info',
+  'vk_wall_post',
+  'vk_users_get',
+  'vk_groups_get_by_id',
+  'vk_groups_get_members',
+  'vk_messages_get_conversations',
+  'vk_messages_get_history',
+  'vk_messages_send',
+]);
+
+// A user token would call these as the person, not as the community.
+const COMMUNITY_ONLY_TOOLS = new Set([
+  'vk_messages_get_conversations',
+  'vk_messages_get_history',
+  'vk_messages_send',
+]);
+
+async function toolsForToken() {
+  const info = await getTokenInfo();
+  if (info.kind === 'community') {
+    return tools.filter((tool) => COMMUNITY_TOOLS.has(tool.name));
+  }
+  if (info.kind === 'none') {
+    return tools;
+  }
+  return tools.filter((tool) => !COMMUNITY_ONLY_TOOLS.has(tool.name));
+}
 
 // Output schemas. A tool that declares one must return structuredContent that
 // validates against it, so these stay deliberately loose: VK adds fields over
@@ -717,6 +847,19 @@ const OUTPUT_SCHEMAS = {
   vk_wall_edit: successOutput,
   vk_wall_delete: successOutput,
   vk_groups_join: successOutput,
+  vk_token_info: {
+    type: 'object',
+    properties: {
+      kind: { type: 'string', description: 'community, user_or_service, vkid or none' },
+      community: { type: 'object', description: 'The community a community token acts as' },
+      scopes: { type: 'array', items: { type: 'string' }, description: 'Scopes of a community token' },
+      tools: { type: 'array', items: { type: 'string' }, description: 'Tools that work with this token' },
+    },
+    required: ['kind', 'tools'],
+  },
+  vk_messages_get_conversations: listOutput('Conversations, newest first'),
+  vk_messages_get_history: listOutput('Messages, newest first'),
+  vk_messages_send: successOutput,
 };
 
 // Per-area icons (SEP-973). Inline SVG data URIs keep them dependency-free and
@@ -740,6 +883,8 @@ const ICONS = {
   photo: icon('<rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="8.5" cy="10" r="1.5"/><path d="m21 16-5-5-4 4-2-2-4 4"/>'),
   chart: icon('<path d="M4 20V10M10 20V4M16 20v-7M22 20H2"/>'),
   heart: icon('<path d="M12 20s-7-4.5-7-9.5A3.9 3.9 0 0 1 12 8a3.9 3.9 0 0 1 7 2.5C19 15.5 12 20 12 20z"/>'),
+  message: icon('<path d="M4 5h16v11H9l-5 4z"/>'),
+  key: icon('<circle cx="8" cy="15" r="4"/><path d="m11 12 9-9M17 6l3 3"/>'),
   search: icon('<circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3"/>'),
 };
 
@@ -763,6 +908,10 @@ const TOOL_ICONS = {
   vk_photos_upload_wall: ICONS.photo,
   vk_stats_get: ICONS.chart,
   vk_likes_get: ICONS.heart,
+  vk_token_info: ICONS.key,
+  vk_messages_get_conversations: ICONS.message,
+  vk_messages_get_history: ICONS.message,
+  vk_messages_send: ICONS.message,
 };
 
 // Tools that change something on VK, and whether the change destroys or
@@ -774,6 +923,7 @@ const WRITING_TOOLS = {
   vk_wall_create_comment: { destructive: false },
   vk_photos_upload_wall: { destructive: false },
   vk_groups_join: { destructive: false, idempotent: true },
+  vk_messages_send: { destructive: false },
 };
 
 // MCP annotations let a client tell reads from writes — so it can auto-approve
@@ -801,6 +951,39 @@ async function handleToolCall(name, args) {
     let result;
 
     switch (name) {
+      case 'vk_token_info': {
+        const info = await getTokenInfo();
+        result = { ...info, tools: (await toolsForToken()).map((tool) => tool.name) };
+        break;
+      }
+
+      case 'vk_messages_get_conversations':
+        result = await vk.messagesGetConversations({
+          group_id: await communityId(),
+          count: args.count ?? 20,
+          offset: args.offset,
+          filter: args.filter,
+        });
+        break;
+
+      case 'vk_messages_get_history':
+        result = await vk.messagesGetHistory({
+          group_id: await communityId(),
+          peer_id: args.peer_id,
+          count: args.count ?? 20,
+          offset: args.offset,
+        });
+        break;
+
+      case 'vk_messages_send':
+        result = await vk.messagesSend({
+          group_id: await communityId(),
+          peer_id: args.peer_id,
+          message: args.message,
+          random_id: Math.floor(Math.random() * 2 ** 31),
+        });
+        break;
+
       case 'vk_users_get':
         result = await vk.usersGet({
           user_ids: args.user_ids,
@@ -1149,7 +1332,7 @@ const server = new Server(
   { capabilities: { tools: {}, prompts: {}, resources: {} } }
 );
 
-server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools }));
+server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: await toolsForToken() }));
 
 server.setRequestHandler(ListResourcesRequestSchema, async () => ({
   resources: UI_RESOURCES.map(({ file, ...resource }) => resource),
