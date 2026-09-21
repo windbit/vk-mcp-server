@@ -344,8 +344,10 @@ describe('without a token', () => {
   });
 
   it('still lists every tool', async () => {
+    // The test token reads as a user token, which hides the community-only tools.
+    const communityOnly = ['vk_messages_get_conversations', 'vk_messages_get_history', 'vk_messages_send'];
     const bareTools = (await bare.listTools()).tools;
-    expect(bareTools.map((t) => t.name).sort()).toEqual(tools.map((t) => t.name).sort());
+    expect(bareTools.map((t) => t.name).sort()).toEqual([...tools.map((t) => t.name), ...communityOnly].sort());
   });
 
   it('still lists prompts', async () => {
